@@ -23,8 +23,10 @@ HPARAMS = ("n_vocab n_audio_ctx n_audio_state n_audio_head n_audio_layer "
 def read_tensors(path):
     f = open(path, "rb")
     magic = f.read(4)
-    if struct.unpack("<I", magic)[0] != 0x67676D6C:
+    magic_val = struct.unpack("<I", magic)[0]
+    if magic_val not in (0x67676D6C, 0x67676D6D):
         sys.exit(f"not a ggml model: magic {magic!r}")
+    repacked = magic_val == 0x67676D6D
 
     hp = struct.unpack("<11i", f.read(44))
     n_mel, n_fft = struct.unpack("<2i", f.read(8))
@@ -45,6 +47,8 @@ def read_tensors(path):
             break
         ne = struct.unpack(f"<{n_dims}i", f.read(4 * n_dims))
         name = f.read(name_len).decode("utf-8", "replace")
+        if repacked:
+            f.seek(-f.tell() % 32, 1)   # padding inserted by repack-model.py
         offset = f.tell()
         count = 1
         for d in ne:
@@ -52,17 +56,18 @@ def read_tensors(path):
         nbytes = count * (2 if ftype == 1 else 4)
         tensors.append((name, offset, nbytes))
         f.seek(nbytes, 1)
-    return dict(zip(HPARAMS, hp)), first_header, tensors, f.tell()
+    return dict(zip(HPARAMS, hp)), first_header, tensors, f.tell(), repacked
 
 
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     path = sys.argv[1]
-    hp, first_header, tensors, end = read_tensors(path)
+    hp, first_header, tensors, end, repacked = read_tensors(path)
     size = os.path.getsize(path)
 
     print(f"file    : {path}")
+    print(f"layout  : {'repacked (mappable)' if repacked else 'stock'}")
     print(f"size    : {size:,} bytes")
     print(f"decoder : {hp['n_text_layer']} layers   encoder: {hp['n_audio_layer']} layers"
           f"   ({'turbo/distilled' if hp['n_text_layer'] <= 8 else 'full'})")

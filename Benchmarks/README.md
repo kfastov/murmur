@@ -103,16 +103,69 @@ Loads are warm-cache — the file is in the page cache from the previous
 iteration. A genuinely cold first load is slower; measuring it needs `sudo
 purge`, so it is deliberately not part of the automated run.
 
-## Targets after the patch
+## Result after the patch
 
-| metric | baseline | expected | why |
+Same machine, same model weights, `--iters 3`. "footprint" is what the process
+is charged for — the number Activity Monitor shows and the one memory pressure
+acts on; "resident" is what is actually in RAM.
+
+```
+stock libs + stock model
+it       load_s   encode_s    footprint     resident        logits_hash
+0         0.984      1.120      1782.5M      1763.2M 0x779680b647c15dfc
+1         0.809      1.028      1608.8M      1603.7M 0x779680b647c15dfc
+peak   : 1794.6 MB
+
+patched libs + repacked model
+it       load_s   encode_s    footprint     resident        logits_hash
+0         0.960      1.047       100.5M        86.8M 0x779680b647c15dfc
+1         0.356      1.036        63.7M        68.7M 0x779680b647c15dfc
+peak   :  110.4 MB
+```
+
+| metric | stock | mapped | |
 |---|---|---|---|
-| `load_s` | 0.79 s | well under | no 1.6 GB read, no copy — map and assign |
-| `internal` (dirty) | ~1600 MB | near zero | weights become file-backed |
-| `external` (clean) | ~0 MB | ~1600 MB | the whole point |
-| peak footprint | 1800 MB | lower | no staging buffer during load |
-| `encode_s` | 1.04 s | unchanged | same weights, same kernels |
-| logits hash | `0x779680b647c15dfc` | **identical** | anything else means corruption |
+| footprint after use | 1695 MB | **82 MB** | 20x |
+| resident | 1604 MB | **69 MB** | 23x |
+| peak during load | 1795 MB | **110 MB** | 16x |
+| load, warm | 0.81 s | **0.36 s** | 2.2x |
+| encode | 1.03 s | 1.04 s | unchanged |
+| logits hash | `0x779680b647c15dfc` | `0x779680b647c15dfc` | **identical** |
 
-The hash is the gate. Faster loading with a changed hash is a regression, not
-a win.
+The gate passes: the fingerprint is bit-identical, so the mapped weights are
+being read correctly.
+
+The weights turn out not to be resident at all. Metal reads them through the
+mapping as the graph runs, and because the pages are clean the kernel drops
+them again instead of paying to keep them — so an idle model costs nothing and
+never reaches swap. Encode time is unchanged, so on this machine there is no
+measurable price for re-reading.
+
+Iteration 0 is consistently slower in both columns: that is the page cache
+filling, not the loader.
+
+## Applying it
+
+The patch is against whisper.cpp **v1.8.4**, which is the version the vendored
+`lib/*.a` were built from (all three public headers match that tag exactly).
+
+```bash
+git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp
+git checkout v1.8.4
+git apply ../Patches/0001-whisper-map-model-weights.patch
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
+      -DGGML_METAL_EMBED_LIBRARY=ON -DBUILD_SHARED_LIBS=OFF \
+      -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF
+cmake --build build -j
+# copy build/src/libwhisper.a and build/ggml/src/**/libggml*.a into ../lib/
+```
+
+Then repack the model once:
+
+```bash
+./repack-model.py model.bin model.mapped.bin
+```
+
+155 lines in one file, 116 of them code. Nothing is added to the read path:
+a stock model still loads exactly as before, and a repacked one falls back to
+reading if the mapping or the backend capability is unavailable.

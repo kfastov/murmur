@@ -44,7 +44,7 @@ static double now_sec(void) {
 // be reclaimed by writing it to swap, while external is file-backed and can be
 // dropped for free and re-read from the model file. Today the weights are
 // entirely internal. Moving them to external is the whole point of the patch.
-typedef struct { uint64_t footprint, internal, compressed, external; } vmsnap;
+typedef struct { uint64_t footprint, internal, compressed, external, resident; } vmsnap;
 
 static vmsnap vm_now(void) {
     task_vm_info_data_t info;
@@ -55,6 +55,11 @@ static vmsnap vm_now(void) {
         s.internal   = info.internal;
         s.compressed = info.compressed;
         s.external   = info.external;
+    }
+    mach_task_basic_info_data_t bi;
+    mach_msg_type_number_t bc = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&bi, &bc) == KERN_SUCCESS) {
+        s.resident = bi.resident_size;
     }
     return s;
 }
@@ -103,12 +108,12 @@ int main(int argc, char **argv) {
     printf("model : %s\n", model);
     printf("iters : %d   (take: %ds synthetic, %d threads)\n\n", iters, TAKE_SEC, N_THREADS);
     printf("%-4s %10s %10s %12s %12s %12s %18s\n",
-           "it", "load_s", "encode_s", "footprint", "internal", "external", "logits_hash");
+           "it", "load_s", "encode_s", "footprint", "resident", "external", "logits_hash");
     printf("%-4s %10s %10s %12s %12s %12s %18s\n",
-           "---", "--------", "--------", "----------", "--dirty---", "--clean---", "----------------");
+           "---", "--------", "--------", "--charged-", "-in RAM---", "--clean---", "----------------");
 
     double load_sum = 0, enc_sum = 0, load_min = 1e9;
-    int64_t fp_sum = 0;
+    int64_t fp_sum = 0, load_fp_sum = 0;
     uint64_t first_hash = 0;
     int mismatches = 0;
 
@@ -135,6 +140,8 @@ int main(int argc, char **argv) {
         whisper_token prompt[1] = { whisper_token_sot(ctx) };
         if (whisper_decode(ctx, prompt, 1, 0, N_THREADS) != 0) { fprintf(stderr, "decode failed\n"); return 1; }
 
+        vmsnap used = vm_now();
+
         const float *logits = whisper_get_logits(ctx);
         uint64_t hash = fnv1a(logits, N_LOGITS * sizeof(float));
 
@@ -143,21 +150,23 @@ int main(int argc, char **argv) {
 
         printf("%-4d %10.3f %10.3f %11.1fM %11.1fM %11.1fM %#18llx\n",
                it, t_load, t_enc,
-               mb(delta(after.footprint, before.footprint)),
-               mb(delta(after.internal, before.internal)),
-               mb(delta(after.external, before.external)),
+               mb(delta(used.footprint, before.footprint)),
+               mb(delta(used.resident, before.resident)),
+               mb(delta(used.external, before.external)),
                (unsigned long long)hash);
 
         load_sum += t_load; enc_sum += t_enc;
         if (t_load < load_min) load_min = t_load;
-        fp_sum += delta(after.footprint, before.footprint);
+        fp_sum += delta(used.footprint, before.footprint);
+        load_fp_sum += delta(after.footprint, before.footprint);
 
         whisper_free(ctx);
     }
 
     printf("\nload   : mean %.3f s   best %.3f s\n", load_sum / iters, load_min);
     printf("encode : mean %.3f s\n", enc_sum / iters);
-    printf("weights: mean %.1f MB phys_footprint\n", mb(fp_sum / iters));
+    printf("weights: mean %.1f MB right after load, %.1f MB after the model is used\n",
+           mb(load_fp_sum / iters), mb(fp_sum / iters));
     printf("         dirty (internal) memory is swap-backed; clean (external) is not\n");
     printf("peak   : %.1f MB lifetime max footprint\n", mb((int64_t)peak_footprint()));
     printf("logits : %s\n", mismatches ? "*** UNSTABLE ACROSS ITERATIONS ***" : "stable across iterations");
