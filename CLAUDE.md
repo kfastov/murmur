@@ -113,7 +113,8 @@ Murmur/
 
 ### AudioRecorder.swift
 - **CRITICAL:** PCM buffers from AVAudioEngine tap are REUSED by the engine. Must copy samples immediately in callback, NOT store buffer references.
-- **Input device selection:** Temporarily switches system default input device for recording, restores on stop. `AudioUnitSetProperty` approach doesn't work — causes `-10868 InitializeActiveNodesInInputChain` error.
+- **Capture is AudioQueue, not AVAudioEngine** (since 2026-09-26). Asks for 16 kHz mono Float32 directly, so there is no resampler. Device pick: `kAudioQueueProperty_CurrentDevice` with the device UID, skipped when the pick is the system default. Saved in `UserDefaults("inputDeviceUID")`.
+- **Why not AVAudioEngine:** opening a Bluetooth headset mic flips it A2DP 44.1/48 kHz → HFP 16 kHz about a second after start. AVAudioEngine's input format follows the default OUTPUT device, so the tap's format changes under it, `AVAudioEngineConfigurationChange` fires and the tap never fires again → empty take, Whisper hallucinates "Субтитры создавал…". Rebuilding the engine on that notification loops: each rebuild re-opens the headset and triggers the next change. Reusing the engine reads a stale format and crashes in `installTap`. AudioQueue delivers straight through the flip. Harness: `Benchmarks/config-change/`.
 - Native mic format: 44100Hz mono (on most Macs)
 - Resampling: linear interpolation to 16kHz
 - Normalization: scale peak to 0.9 (mic raw levels are ~0.03-0.05, too quiet for whisper)
